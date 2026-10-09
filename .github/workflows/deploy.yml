@@ -7,7 +7,8 @@
 # Réglages par environnement GitHub (Settings → Environments → staging / production) :
 #   variables : DEPLOY_HOST, DEPLOY_USER, DEPLOY_PORT (22 par défaut), BASE_URL
 #   secrets   : DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS, BASIC_AUTH (si l'environnement est protégé, « user:motdepasse »)
-# Le workflow appelant passe « secrets: inherit ».
+# Le workflow appelant transmet les secrets par leur nom (« secrets: inherit » ne fonctionne qu'au sein d'une même
+# organisation) ; un secret qui n'existe que dans l'environnement se transmet aussi ainsi.
 name: Déploiement
 
 on:
@@ -35,6 +36,14 @@ on:
                 description: Vérifie robots.txt et X-Robots-Tag (fermés hors production, ouverts en production)
                 type: boolean
                 default: true
+        secrets:
+            DEPLOY_SSH_KEY:
+                required: true
+            DEPLOY_KNOWN_HOSTS:
+                required: true
+            BASIC_AUTH:
+                description: « user:motdepasse » si l'environnement est protégé
+                required: false
 
 permissions:
     contents: read

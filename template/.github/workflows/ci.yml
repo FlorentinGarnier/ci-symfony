@@ -38,4 +38,7 @@ jobs:
             php_image: ${{ needs.images.outputs.php_image }}
             web_image: ${{ needs.images.outputs.web_image }}
             commit: ${{ github.sha }}
-        secrets: inherit
+        secrets:
+            DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+            DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+            BASIC_AUTH: ${{ secrets.BASIC_AUTH }}

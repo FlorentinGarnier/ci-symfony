@@ -62,7 +62,8 @@ Entrées : `php-version`, `php-extensions`, `database` (`mysql` | `postgres` | `
    - environnements `staging` (branche `main`) et `production` (branche `main` et étiquettes `v*`) : variables
      `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_PORT`, `BASE_URL` ; secrets `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS`
      (clé publique du serveur vérifiée hors bande, jamais un `ssh-keyscan` au moment du déploiement), et `BASIC_AUTH`
-     (`recette:<mot de passe>`) pour staging ;
+     (`recette:<mot de passe>`) pour staging ; les fichiers d'appel les transmettent par leur nom (`secrets: inherit`
+     ne fonctionne pas d'une organisation à l'autre) ;
    - protection de `main` : fusion par demande, contrôles « Qualité, analyse statique et assets »,
      « Base de données et tests » et « Images » obligatoires ;
    - création des releases réservée aux mainteneurs.
