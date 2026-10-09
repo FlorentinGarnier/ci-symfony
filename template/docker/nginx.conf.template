@@ -5,6 +5,11 @@ server {
     server_name _;
     root /srv/app/public;
     server_tokens off;
+
+    # PHP résolu à chaque requête par le DNS interne de Docker (cache de 10 s), et non une fois au démarrage :
+    # un redémarrage du seul conteneur php (nouvelle adresse IP) ne casse plus le serveur web.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $php_upstream php:9000;
     client_max_body_size 24m;
 
     # Staging : accès restreint. Production : off.
@@ -37,7 +42,7 @@ server {
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT $realpath_root;
-        fastcgi_pass php:9000;
+        fastcgi_pass $php_upstream;
         internal;
     }
 
