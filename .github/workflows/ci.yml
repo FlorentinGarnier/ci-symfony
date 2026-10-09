@@ -175,9 +175,10 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 20
         services:
-            # Un service dont l'image est vide n'est pas démarré.
+            # Un service dont l'image est vide n'est pas démarré. Images officielles via mirror.gcr.io (miroir de Google) :
+            # les runners partagent leurs IP et Docker Hub limite les téléchargements anonymes.
             mysql:
-                image: ${{ inputs.database == 'mysql' && 'mysql:8.4' || '' }}
+                image: ${{ inputs.database == 'mysql' && 'mirror.gcr.io/library/mysql:8.4' || '' }}
                 env:
                     MYSQL_ROOT_PASSWORD: root
                 ports:
@@ -186,7 +187,7 @@ jobs:
                     --health-cmd="mysqladmin ping -h127.0.0.1 -proot --silent"
                     --health-interval=5s --health-timeout=3s --health-retries=20
             postgres:
-                image: ${{ inputs.database == 'postgres' && 'postgres:16-alpine' || '' }}
+                image: ${{ inputs.database == 'postgres' && 'mirror.gcr.io/library/postgres:16-alpine' || '' }}
                 env:
                     POSTGRES_USER: app
                     POSTGRES_PASSWORD: app
