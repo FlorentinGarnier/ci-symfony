@@ -48,7 +48,13 @@ jobs:
                         echo "publish=$PUBLISH"
                     } >> "$GITHUB_OUTPUT"
 
+            # Images de base de Docker Hub via mirror.gcr.io (miroir de Google) : les runners partagent leurs IP
+            # et Docker Hub limite les téléchargements anonymes. Les Dockerfile des projets restent inchangés.
             -   uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+                with:
+                    buildkitd-config-inline: |
+                        [registry."docker.io"]
+                          mirrors = ["mirror.gcr.io"]
 
             -   if: steps.meta.outputs.publish == 'true'
                 uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
