@@ -1,0 +1,145 @@
+# Déploie une paire d'images (par digest) sur un environnement, puis lance les tests de fumée depuis l'extérieur.
+# Si les tests de fumée échouent, l'environnement revient à la version précédente.
+#
+# Le serveur fait le travail (voir server/README.md) : la clé SSH de chaque environnement est limitée à une
+# commande forcée qui n'accepte que « deploy <env> <php@sha256> <web@sha256> » et « rollback <env> ».
+#
+# Réglages par environnement GitHub (Settings → Environments → staging / production) :
+#   variables : DEPLOY_HOST, DEPLOY_USER, DEPLOY_PORT (22 par défaut), BASE_URL
+#   secrets   : DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS, BASIC_AUTH (si l'environnement est protégé, « user:motdepasse »)
+# Le workflow appelant passe « secrets: inherit ».
+name: Déploiement
+
+on:
+    workflow_call:
+        inputs:
+            environment:
+                description: staging ou production
+                type: string
+                required: true
+            php_image:
+                type: string
+                required: true
+            web_image:
+                type: string
+                required: true
+            commit:
+                description: Commit attendu dans la réponse de la sonde (si elle l'expose)
+                type: string
+                default: ""
+            smoke-path:
+                description: Page de santé appelée par les tests de fumée
+                type: string
+                default: /healthz
+            check-indexing:
+                description: Vérifie robots.txt et X-Robots-Tag (fermés hors production, ouverts en production)
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
+
+jobs:
+    deploy:
+        name: ${{ inputs.environment }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        environment:
+            name: ${{ inputs.environment }}
+            url: ${{ vars.BASE_URL }}
+        concurrency:
+            group: deploy-${{ inputs.environment }}
+            cancel-in-progress: false
+        steps:
+            -   name: Accès SSH
+                env:
+                    SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+                    KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+                    SSH_HOST: ${{ vars.DEPLOY_HOST }}
+                    SSH_USER: ${{ vars.DEPLOY_USER }}
+                    SSH_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+                run: |
+                    set -euo pipefail
+                    [[ "$SSH_HOST" =~ ^[a-zA-Z0-9.-]+$ ]]
+                    [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+                    [[ "$SSH_PORT" =~ ^[0-9]+$ ]]
+                    install -m 700 -d ~/.ssh
+                    printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+                    printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+                    chmod 600 ~/.ssh/id_deploy ~/.ssh/known_hosts
+                    printf 'Host target\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/id_deploy\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n  ConnectTimeout 15\n' \
+                        "$SSH_HOST" "$SSH_USER" "$SSH_PORT" > ~/.ssh/config
+
+            -   name: Déploiement
+                env:
+                    TARGET: ${{ inputs.environment }}
+                    PHP_IMAGE: ${{ inputs.php_image }}
+                    WEB_IMAGE: ${{ inputs.web_image }}
+                run: |
+                    set -euo pipefail
+                    [[ "$TARGET" =~ ^(staging|production)$ ]]
+                    [[ "$PHP_IMAGE" =~ ^ghcr\.io/[a-z0-9_./-]+-php@sha256:[a-f0-9]{64}$ ]]
+                    [[ "$WEB_IMAGE" =~ ^ghcr\.io/[a-z0-9_./-]+-web@sha256:[a-f0-9]{64}$ ]]
+                    ssh target "deploy $TARGET $PHP_IMAGE $WEB_IMAGE"
+
+            -   name: Tests de fumée
+                id: smoke
+                env:
+                    BASE_URL: ${{ vars.BASE_URL }}
+                    STAGE: ${{ inputs.environment }}
+                    EXPECTED: ${{ inputs.commit }}
+                    SMOKE_PATH: ${{ inputs.smoke-path }}
+                    CHECK_INDEXING: ${{ inputs.check-indexing }}
+                    BASIC_AUTH: ${{ secrets.BASIC_AUTH }}
+                run: |
+                    set -uo pipefail
+                    base="${BASE_URL%/}"
+                    [[ -n "$base" ]] || { echo "::error::Variable BASE_URL absente pour l'environnement $STAGE."; exit 1; }
+                    failures=0
+                    ok() { printf '  ✓ %s\n' "$*"; }
+                    ko() { printf '  ✗ %s\n' "$*"; failures=$((failures + 1)); }
+                    auth=(); [[ -n "$BASIC_AUTH" ]] && auth=(-u "$BASIC_AUTH")
+
+                    echo "Tests de fumée sur $base ($STAGE)"
+
+                    health="$(curl -fsS --retry 5 --retry-delay 3 --retry-all-errors "${auth[@]}" "$base$SMOKE_PATH" || true)"
+                    if [[ -n "$health" ]]; then ok "$SMOKE_PATH répond"; else ko "$SMOKE_PATH ne répond pas"; fi
+                    if [[ "$health" == *'"status"'* ]]; then
+                        if [[ "$health" == *'"status":"ok"'* ]]; then ok "sonde : status ok"; else ko "sonde : $health"; fi
+                    fi
+                    if [[ -n "$EXPECTED" && "$health" == *'"commit"'* ]]; then
+                        if [[ "$health" == *"\"commit\":\"$EXPECTED\""* ]]; then ok "commit déployé = $EXPECTED"; else ko "commit déployé différent de $EXPECTED"; fi
+                    fi
+
+                    if [[ "$CHECK_INDEXING" == true ]]; then
+                        robots="$(curl -fsS "${auth[@]}" "$base/robots.txt" || true)"
+                        headers="$(curl -sS -o /dev/null -D - "${auth[@]}" "$base/" | tr -d '\r')"
+                        if [[ "$STAGE" == production ]]; then
+                            if grep -qx 'Disallow: /' <<< "$robots"; then ko "robots.txt de production contient « Disallow: / »"; else ok "robots.txt de production ouvert"; fi
+                            if grep -qi '^x-robots-tag:.*noindex' <<< "$headers"; then ko "en-tête noindex présent en production"; else ok "aucun noindex global en production"; fi
+                        else
+                            if grep -qx 'Disallow: /' <<< "$robots"; then ok "robots.txt fermé"; else ko "robots.txt de $STAGE n'est pas fermé"; fi
+                            if grep -qi '^x-robots-tag:.*noindex' <<< "$headers"; then ok "en-tête noindex présent"; else ko "en-tête noindex absent sur $STAGE"; fi
+                        fi
+                    fi
+
+                    if [[ -n "$BASIC_AUTH" ]]; then
+                        code="$(curl -s -o /dev/null -w '%{http_code}' "$base/")"
+                        if [[ "$code" == 401 ]]; then ok "accès refusé sans identifiants"; else ko "accès sans identifiants : HTTP $code"; fi
+                    fi
+
+                    home="$(curl -s -L -o /dev/null -w '%{http_code}' "${auth[@]}" "$base/")"
+                    if [[ "$home" == 200 ]]; then ok "page d'accueil : 200"; else ko "page d'accueil : HTTP $home"; fi
+
+                    if (( failures > 0 )); then echo "$failures contrôle(s) en échec"; exit 1; fi
+                    echo "Tous les contrôles sont passés"
+
+            -   name: Retour à la version précédente
+                if: failure() && steps.smoke.outcome == 'failure'
+                env:
+                    TARGET: ${{ inputs.environment }}
+                run: ssh target "rollback $TARGET"
+
+            -   name: Suppression des identifiants SSH
+                if: always()
+                run: rm -f ~/.ssh/id_deploy ~/.ssh/known_hosts

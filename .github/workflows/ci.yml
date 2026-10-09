@@ -1,0 +1,272 @@
+# Contrôles communs à tous les projets Symfony / Sylius.
+# Les outils sont détectés à partir des fichiers du projet : rien à déclarer s'il suit les conventions (voir README).
+#
+#   jobs:
+#       ci:
+#           uses: FlorentinGarnier/ci-symfony/.github/workflows/ci.yml@v1
+#           with:
+#               php-version: "8.4"
+name: CI
+
+on:
+    workflow_call:
+        inputs:
+            php-version:
+                description: Version de PHP (celle de production)
+                type: string
+                default: "8.4"
+            php-extensions:
+                description: Extensions PHP (syntaxe shivammathur/setup-php)
+                type: string
+                default: apcu, bcmath, exif, gd, intl, pdo_mysql, pdo_pgsql, zip
+            node-version:
+                description: Version de Node pour les assets (ignorée sans package.json)
+                type: string
+                default: "22"
+            database:
+                description: mysql, postgres ou none
+                type: string
+                default: mysql
+            database-setup:
+                description: "migrations (base vide + migrations + schema:validate) ou schema (doctrine:schema:create)"
+                type: string
+                default: migrations
+            # --no-scripts par défaut : le cache:clear des scripts Composer n'est pas utile aux contrôles et échoue sur
+            # Sylius 2.3 en test avec un cache vide (« DoctrineMetadataCacheWarmer must load metadata first »).
+            composer-flags:
+                description: Options supplémentaires de composer install
+                type: string
+                default: --no-scripts
+            behat-tags:
+                description: Filtre de tags Behat
+                type: string
+                default: "~@javascript&&~@todo"
+            assets-script:
+                description: Script de build des assets (par défaut build:prod, sinon build)
+                type: string
+                default: ""
+            before-script:
+                description: Commande lancée avant l'installation des dépendances (ex. copie d'un .env)
+                type: string
+                default: ""
+            env:
+                description: Variables d'environnement supplémentaires pour les tests, une par ligne (CLE=valeur)
+                type: string
+                default: ""
+
+permissions:
+    contents: read
+
+env:
+    APP_ENV: test
+
+jobs:
+    static:
+        name: Qualité, analyse statique et assets
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            -   uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+                with:
+                    php-version: ${{ inputs.php-version }}
+                    extensions: ${{ inputs.php-extensions }}
+                    tools: composer:v2
+                    coverage: none
+
+            -   name: Variables du projet
+                if: inputs.env != ''
+                env:
+                    EXTRA_ENV: ${{ inputs.env }}
+                run: printf '%s\n' "$EXTRA_ENV" >> "$GITHUB_ENV"
+
+            -   name: Préparation du projet
+                if: inputs.before-script != ''
+                run: ${{ inputs.before-script }}
+
+            -   name: Cache Composer
+                uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+                with:
+                    path: ~/.cache/composer
+                    key: composer-${{ inputs.php-version }}-${{ hashFiles('composer.lock') }}
+                    restore-keys: composer-${{ inputs.php-version }}-
+
+            -   name: Composer validate
+                run: composer validate --strict --no-check-publish
+
+            -   name: Install PHP dependencies
+                run: composer install --no-interaction --no-progress --prefer-dist ${{ inputs.composer-flags }}
+
+            # Les paquets abandonnés sont signalés, pas bloquants. Une faille l'est.
+            -   name: Audit de sécurité
+                run: composer audit --locked --abandoned=report
+
+            -   name: Style
+                run: |
+                    if [[ -f ecs.php ]]; then
+                        vendor/bin/ecs check --no-progress-bar
+                    elif [[ -f .php-cs-fixer.dist.php || -f .php-cs-fixer.php ]]; then
+                        vendor/bin/php-cs-fixer fix --dry-run --diff --using-cache=no
+                    else
+                        echo "::warning::Ni ecs.php ni .php-cs-fixer.dist.php : style non contrôlé."
+                    fi
+
+            -   name: Analyse statique (PHPStan)
+                run: |
+                    if compgen -G 'phpstan.neon*' > /dev/null || [[ -f phpstan.dist.neon ]]; then
+                        vendor/bin/phpstan analyse --no-progress
+                    else
+                        echo "::warning::Pas de phpstan.neon : analyse statique non faite."
+                    fi
+
+            -   name: Lint Twig
+                if: hashFiles('templates/**') != ''
+                run: bin/console lint:twig templates
+
+            -   name: Lint YAML
+                run: |
+                    dirs=(); for d in config translations; do [[ -d "$d" ]] && dirs+=("$d"); done
+                    bin/console lint:yaml "${dirs[@]}" --parse-tags
+
+            -   name: Lint du conteneur (prod)
+                run: APP_ENV=prod APP_DEBUG=0 bin/console lint:container
+
+            -   name: Gestionnaire de paquets JS
+                id: js
+                run: |
+                    if   [[ -f yarn.lock ]];          then echo "pm=yarn" >> "$GITHUB_OUTPUT"
+                    elif [[ -f pnpm-lock.yaml ]];     then echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+                    elif [[ -f package-lock.json ]];  then echo "pm=npm"  >> "$GITHUB_OUTPUT"
+                    fi
+
+            -   if: steps.js.outputs.pm == 'pnpm'
+                uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+            -   if: steps.js.outputs.pm != ''
+                uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+                with:
+                    node-version: ${{ inputs.node-version }}
+                    cache: ${{ steps.js.outputs.pm }}
+
+            -   name: Compilation des assets
+                env:
+                    PM: ${{ steps.js.outputs.pm }}
+                    SCRIPT: ${{ inputs.assets-script }}
+                run: |
+                    if [[ -n "$PM" ]]; then
+                        case "$PM" in
+                            yarn) yarn install --frozen-lockfile --non-interactive ;;
+                            pnpm) pnpm install --frozen-lockfile ;;
+                            npm)  npm ci ;;
+                        esac
+                        if [[ -z "$SCRIPT" ]]; then
+                            SCRIPT="$(jq -r 'if .scripts["build:prod"] then "build:prod" else "build" end' package.json)"
+                        fi
+                        "$PM" run "$SCRIPT"
+                    fi
+                    if [[ -f importmap.php ]]; then
+                        bin/console importmap:install
+                        APP_ENV=prod bin/console asset-map:compile
+                    fi
+
+    tests:
+        name: Base de données et tests
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        services:
+            # Un service dont l'image est vide n'est pas démarré.
+            mysql:
+                image: ${{ inputs.database == 'mysql' && 'mysql:8.4' || '' }}
+                env:
+                    MYSQL_ROOT_PASSWORD: root
+                ports:
+                    - 3306:3306
+                options: >-
+                    --health-cmd="mysqladmin ping -h127.0.0.1 -proot --silent"
+                    --health-interval=5s --health-timeout=3s --health-retries=20
+            postgres:
+                image: ${{ inputs.database == 'postgres' && 'postgres:16-alpine' || '' }}
+                env:
+                    POSTGRES_USER: app
+                    POSTGRES_PASSWORD: app
+                    POSTGRES_DB: app
+                ports:
+                    - 5432:5432
+                options: >-
+                    --health-cmd="pg_isready -U app -d app"
+                    --health-interval=5s --health-timeout=3s --health-retries=20
+        steps:
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            -   uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+                with:
+                    php-version: ${{ inputs.php-version }}
+                    extensions: ${{ inputs.php-extensions }}
+                    tools: composer:v2
+                    coverage: none
+
+            -   name: Base de test
+                env:
+                    DATABASE: ${{ inputs.database }}
+                run: |
+                    case "$DATABASE" in
+                        mysql)    echo "DATABASE_URL=mysql://root:root@127.0.0.1:3306/app?serverVersion=8.4.0&charset=utf8mb4" >> "$GITHUB_ENV" ;;
+                        postgres) echo "DATABASE_URL=postgresql://app:app@127.0.0.1:5432/app?serverVersion=16&charset=utf8" >> "$GITHUB_ENV" ;;
+                    esac
+
+            -   name: Variables du projet
+                if: inputs.env != ''
+                env:
+                    EXTRA_ENV: ${{ inputs.env }}
+                run: printf '%s\n' "$EXTRA_ENV" >> "$GITHUB_ENV"
+
+            -   name: Préparation du projet
+                if: inputs.before-script != ''
+                run: ${{ inputs.before-script }}
+
+            -   name: Cache Composer
+                uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+                with:
+                    path: ~/.cache/composer
+                    key: composer-${{ inputs.php-version }}-${{ hashFiles('composer.lock') }}
+                    restore-keys: composer-${{ inputs.php-version }}-
+
+            -   name: Install PHP dependencies
+                run: composer install --no-interaction --no-progress --prefer-dist ${{ inputs.composer-flags }}
+
+            -   name: Base de données
+                if: inputs.database != 'none'
+                env:
+                    SETUP: ${{ inputs.database-setup }}
+                run: |
+                    bin/console doctrine:database:create --if-not-exists --no-interaction
+                    if [[ "$SETUP" == schema ]]; then
+                        bin/console doctrine:schema:create --no-interaction
+                    else
+                        bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration
+                        bin/console doctrine:schema:validate
+                    fi
+
+            -   name: Tests unitaires et fonctionnels (PHPUnit)
+                if: hashFiles('phpunit.xml.dist', 'phpunit.dist.xml', 'phpunit.xml') != ''
+                run: vendor/bin/phpunit
+
+            # Ignoré tant qu'aucun scénario n'existe dans features/.
+            -   name: Scénarios Behat
+                env:
+                    TAGS: ${{ inputs.behat-tags }}
+                run: |
+                    if [[ -x vendor/bin/behat ]] && find features -name '*.feature' 2>/dev/null | grep -q .; then
+                        vendor/bin/behat --strict --no-interaction --colors -f progress --tags="$TAGS"
+                    else
+                        echo "Aucun scénario Behat : étape ignorée."
+                    fi
+
+            -   name: Journaux en cas d'échec
+                if: failure()
+                uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+                with:
+                    name: logs-${{ github.run_id }}-${{ github.run_attempt }}
+                    path: var/log
+                    if-no-files-found: ignore

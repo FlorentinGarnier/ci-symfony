@@ -1,0 +1,41 @@
+# Chaque demande de fusion : contrôles et construction des images.
+# Chaque fusion sur main : contrôles, images publiées par digest, déploiement automatique sur staging.
+# Seul fichier où se trouvent les réglages propres au projet (voir FlorentinGarnier/ci-symfony).
+name: CI
+
+on:
+    pull_request: ~
+    push:
+        branches: [main]
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+    checks:
+        uses: FlorentinGarnier/ci-symfony/.github/workflows/ci.yml@v1
+        with:
+            php-version: "8.4"
+            database: postgres
+
+    images:
+        needs: checks
+        uses: FlorentinGarnier/ci-symfony/.github/workflows/build.yml@v1
+        permissions:
+            contents: read
+            packages: write
+
+    staging:
+        if: github.event_name == 'push'
+        needs: images
+        uses: FlorentinGarnier/ci-symfony/.github/workflows/deploy.yml@v1
+        with:
+            environment: staging
+            php_image: ${{ needs.images.outputs.php_image }}
+            web_image: ${{ needs.images.outputs.web_image }}
+            commit: ${{ github.sha }}
+        secrets: inherit

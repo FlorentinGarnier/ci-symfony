@@ -1,0 +1,97 @@
+# Pile d'un environnement sur le serveur (/srv/<appli>/staging ou /srv/<appli>/production), derrière Traefik.
+# Même fichier pour les deux environnements : seuls stack.env (Compose) et app.env (application) changent.
+# Installé à la main par l'administrateur, jamais copié par la CI. Ne pas lancer à la main : <appli>-deploy s'en charge.
+#
+# Noms de services attendus par le script de déploiement : database, php, web, maintenance.
+# Les autres (worker, scheduler, mercure…) sont arrêtés et relancés avec l'application.
+
+x-app: &app
+    image: ${PHP_IMAGE:?PHP_IMAGE doit être une image GHCR par digest}
+    restart: unless-stopped
+    cpus: ${APP_CPUS:-1.0}
+    mem_limit: ${APP_MEMORY:-1g}
+    env_file: app.env
+    volumes:
+        - sessions:/srv/app/var/sessions
+    networks: [backend]
+    depends_on:
+        database: { condition: service_healthy }
+    logging: &logging
+        driver: json-file
+        options: { max-size: "10m", max-file: "3" }
+
+services:
+    database:
+        image: postgres:16-alpine
+        restart: unless-stopped
+        environment:
+            POSTGRES_DB: ${POSTGRES_DB:?required}
+            POSTGRES_USER: ${POSTGRES_USER:?required}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+        volumes: ["database:/var/lib/postgresql/data"]
+        networks: [backend]
+        healthcheck:
+            test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+            interval: 5s
+            timeout: 5s
+            retries: 20
+        logging: *logging
+
+    php:
+        <<: *app
+
+    worker:
+        <<: *app
+        command: [php, bin/console, messenger:consume, async, --time-limit=3600, --memory-limit=256M, --no-interaction]
+        stop_grace_period: 60s
+
+    web:
+        image: ${WEB_IMAGE:?WEB_IMAGE doit être une image GHCR par digest}
+        restart: unless-stopped
+        environment:
+            # Staging : libellé d'un seul mot (authentification active, comptes dans ./htpasswd). Production : off.
+            AUTH_BASIC: ${AUTH_BASIC:-off}
+        volumes:
+            - ./htpasswd:/etc/nginx/htpasswd:ro
+        networks: [backend, proxy]
+        depends_on: [php]
+        labels:
+            - traefik.enable=true
+            - traefik.docker.network=${TRAEFIK_NETWORK:?required}
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME:?required}.rule=Host(`${APP_HOST:?required}`)
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}.entrypoints=${TRAEFIK_ENTRYPOINT:?required}
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls=true
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls.certresolver=${TRAEFIK_CERTRESOLVER:?required}
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}.service=${COMPOSE_PROJECT_NAME}
+            - traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=80
+        logging: *logging
+
+    # Servie directement par Nginx et routée avant l'application (priorité 1000) : aucune dépendance à PHP
+    # ni à la base, elle reste disponible pendant les migrations. Démarrée uniquement par le script de déploiement.
+    maintenance:
+        image: ${WEB_IMAGE:?WEB_IMAGE doit être une image GHCR par digest}
+        profiles: [maintenance]
+        restart: unless-stopped
+        command: [nginx, -g, "daemon off;", -c, /srv/maintenance/nginx.conf]
+        networks: [proxy]
+        labels:
+            - traefik.enable=true
+            - traefik.docker.network=${TRAEFIK_NETWORK:?required}
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME:?required}-maintenance.rule=Host(`${APP_HOST:?required}`)
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}-maintenance.priority=1000
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}-maintenance.entrypoints=${TRAEFIK_ENTRYPOINT:?required}
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}-maintenance.tls=true
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}-maintenance.tls.certresolver=${TRAEFIK_CERTRESOLVER:?required}
+            - traefik.http.routers.${COMPOSE_PROJECT_NAME}-maintenance.service=${COMPOSE_PROJECT_NAME}-maintenance
+            - traefik.http.services.${COMPOSE_PROJECT_NAME}-maintenance.loadbalancer.server.port=80
+        logging: *logging
+
+networks:
+    backend: {}
+    proxy:
+        external: true
+        name: ${TRAEFIK_NETWORK}
+
+volumes:
+    database: {}
+    sessions: {}

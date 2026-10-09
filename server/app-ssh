@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Commande forcée de la clé SSH de déploiement d'un environnement : aucun shell, seulement le déploiement
+# d'images par digest ou le retour arrière, et seulement pour cet environnement.
+# Installé en /usr/local/bin/<appli>-ssh ; dans ~/.ssh/authorized_keys du compte de déploiement :
+#
+#   command="/usr/local/bin/<appli>-ssh staging",restrict ssh-ed25519 AAAA… github-<appli>-staging
+#   command="/usr/local/bin/<appli>-ssh production",restrict ssh-ed25519 AAAA… github-<appli>-production
+set -euo pipefail
+
+app=$(basename "$0"); app=${app%-ssh}
+target=${1:-}
+[[ "$target" =~ ^(staging|production)$ ]] || exit 2
+prefix=$(cat "/srv/$app/image-prefix")
+[[ "$prefix" =~ ^ghcr\.io/[a-z0-9_./-]+$ ]] || exit 2
+
+command=${SSH_ORIGINAL_COMMAND:-}
+deploy="^deploy $target (ghcr\\.io/[a-z0-9_./-]+-php@sha256:[a-f0-9]{64}) (ghcr\\.io/[a-z0-9_./-]+-web@sha256:[a-f0-9]{64})$"
+
+if [[ "$command" =~ $deploy ]] \
+    && [[ ${BASH_REMATCH[1]} == "$prefix-php@sha256:"* ]] \
+    && [[ ${BASH_REMATCH[2]} == "$prefix-web@sha256:"* ]]; then
+    exec "/usr/local/bin/$app-deploy" "$target" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+fi
+if [[ "$command" == "rollback $target" ]]; then
+    exec "/usr/local/bin/$app-deploy" "$target" --rollback
+fi
+
+printf 'Seuls « deploy %s <php@sha256> <web@sha256> » et « rollback %s » sont autorisés avec cette clé.\n' "$target" "$target" >&2
+exit 2

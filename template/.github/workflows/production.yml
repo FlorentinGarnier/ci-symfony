@@ -1,0 +1,42 @@
+# Mise en production par publication d'une GitHub Release sur un commit recetté en staging :
+# images exactes de staging (par digest), analyse Trivy, déploiement, tests de fumée, retour arrière si échec.
+# Lancement manuel avec une release existante : remise en service d'une version déjà publiée.
+name: Production
+
+on:
+    release:
+        types: [published]
+    workflow_dispatch:
+        inputs:
+            release_tag:
+                description: Release à (re)mettre en service, ex. v1.3.2
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+concurrency:
+    group: production
+    cancel-in-progress: false
+
+jobs:
+    release:
+        if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
+        uses: FlorentinGarnier/ci-symfony/.github/workflows/release.yml@v1
+        permissions:
+            actions: read
+            contents: read
+            packages: read
+        with:
+            release-tag: ${{ inputs.release_tag }}
+
+    deploy:
+        needs: release
+        uses: FlorentinGarnier/ci-symfony/.github/workflows/deploy.yml@v1
+        with:
+            environment: production
+            php_image: ${{ needs.release.outputs.php_image }}
+            web_image: ${{ needs.release.outputs.web_image }}
+            commit: ${{ needs.release.outputs.commit }}
+        secrets: inherit

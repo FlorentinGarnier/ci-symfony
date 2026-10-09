@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Déploiement d'une application Symfony / Sylius sur ce serveur (Docker Compose).
+# Installé en /usr/local/bin/<appli>-deploy : le nom de l'application est déduit du nom du script,
+# ses environnements sont /srv/<appli>/staging et /srv/<appli>/production.
+#
+#   <appli>-deploy <staging|production> <image php@sha256:…> <image web@sha256:…>
+#   <appli>-deploy <staging|production> --rollback      revient à la version précédente, sans migration
+#
+# Étapes : verrou, contrôle des images, sauvegarde de la base, page de maintenance, arrêt des services,
+# migrations, redémarrage, contrôles internes, fin de la maintenance. Si les contrôles échouent après les
+# migrations, la version précédente est remise en service (règle : migrations compatibles avec la version
+# précédente). Si une migration échoue, la maintenance reste active : inspecter le schéma avant toute reprise.
+#
+# Fichiers de chaque environnement : compose.yaml, stack.env (Compose), app.env (application), et ceux tenus
+# par ce script : candidate.env, current.env, previous.env, validated.env (staging), history.env (production).
+set -Eeuo pipefail
+umask 077
+
+app=$(basename "$0"); app=${app%-deploy}
+root=/srv/$app
+log() { printf '[%s %s] %s\n' "$app-deploy" "$(date '+%F %T')" "$*"; }
+die() { log "ERREUR : $*" >&2; exit 1; }
+
+[[ $# == 2 || $# == 3 ]] || { echo "Usage : $app-deploy staging|production PHP_IMAGE WEB_IMAGE | --rollback" >&2; exit 2; }
+target=$1
+[[ "$target" =~ ^(staging|production)$ ]] || exit 2
+
+# Un seul déploiement à la fois sur le serveur, tous environnements confondus.
+exec 9>"$root/deploy.lock"
+flock -w 900 9 || die "verrou $root/deploy.lock occupé"
+cd "$root/$target"
+
+if [[ -e MIGRATION_PENDING ]]; then
+    die "environnement en attente de reprise de données (MIGRATION_PENDING) : terminer la bascule avant tout déploiement"
+fi
+
+# Comptes de l'authentification de staging, montés dans l'image web : le fichier doit exister et être lisible.
+[[ -e htpasswd ]] || { touch htpasswd; chmod 644 htpasswd; }
+
+conf() { grep -E "^$1=" stack.env | tail -n1 | cut -d= -f2- | sed -e "s/^['\"]//" -e "s/['\"]$//"; }
+prefix=$(cat "$root/image-prefix")
+[[ "$prefix" =~ ^ghcr\.io/[a-z0-9_./-]+$ ]] || die "préfixe d'images invalide dans $root/image-prefix"
+
+rollback=false
+if [[ "$2" == --rollback ]]; then
+    [[ $# == 2 ]] || exit 2
+    rollback=true
+    [[ -s previous.env ]] || die "aucune version précédente enregistrée"
+    cp previous.env candidate.env
+else
+    [[ $# == 3 ]] || exit 2
+    printf 'PHP_IMAGE=%s\nWEB_IMAGE=%s\n' "$2" "$3" > candidate.env
+fi
+php_image=$(grep '^PHP_IMAGE=' candidate.env | cut -d= -f2-)
+web_image=$(grep '^WEB_IMAGE=' candidate.env | cut -d= -f2-)
+[[ "$php_image" == "$prefix-php@sha256:"* && "$php_image" =~ @sha256:[a-f0-9]{64}$ ]] || die "image php refusée : $php_image"
+[[ "$web_image" == "$prefix-web@sha256:"* && "$web_image" =~ @sha256:[a-f0-9]{64}$ ]] || die "image web refusée : $web_image"
+
+# La production n'accepte que la paire validée en staging, ou une paire qu'elle a déjà servie (retour arrière).
+if [[ "$target" == production && "$rollback" == false ]]; then
+    if ! cmp -s candidate.env "$root/staging/validated.env" \
+        && ! grep -qxF "$php_image $web_image" history.env 2>/dev/null; then
+        die "la production n'accepte que les images validées en staging ou déjà servies en production"
+    fi
+fi
+
+current=$(cat current.env 2>/dev/null || true)
+if [[ "$current" == "$(cat candidate.env)" ]]; then
+    log "cette version est déjà en service"
+    exit 0
+fi
+
+compose() { docker compose --env-file stack.env --env-file "${env_file:-candidate.env}" -f compose.yaml "$@"; }
+compose config --quiet
+
+# Services applicatifs : tous ceux du projet Compose sauf la base (et ceux listés dans KEEP_RUNNING).
+keep=" database $(conf KEEP_RUNNING) "
+services=()
+while read -r service; do
+    [[ "$keep" == *" $service "* ]] || services+=("$service")
+done < <(compose config --services)
+healthcheck_path=$(conf HEALTHCHECK_PATH); healthcheck_path=${healthcheck_path:-/healthz}
+
+healthy() {
+    compose exec -T php php bin/console dbal:run-sql 'SELECT 1' > /dev/null || return 1
+    for _ in {1..20}; do
+        if compose exec -T web wget -q -O /dev/null "http://127.0.0.1$healthcheck_path"; then return 0; fi
+        sleep 3
+    done
+    return 1
+}
+
+log "version actuelle : ${current:-aucune}"
+log "nouvelle version : $php_image $web_image"
+
+compose pull --quiet
+# La maintenance utilise l'image web immuable ; elle est derrière un profil Compose, d'où ce téléchargement explicite.
+compose --profile maintenance pull --quiet maintenance
+compose up -d --wait database
+
+# Sauvegarde avant toute migration.
+mkdir -p backups
+backup="backups/$(date -u +%Y%m%dT%H%M%SZ)-avant-deploiement"
+if compose exec -T database sh -c 'command -v pg_dump' > /dev/null 2>&1; then
+    backup+=.dump
+    compose exec -T database sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup"
+else
+    backup+=.sql.gz
+    compose exec -T database sh -c 'exec mysqldump --single-transaction --routines --no-tablespaces -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"' | gzip > "$backup"
+fi
+[[ -s "$backup" ]] || die "sauvegarde vide : $backup"
+log "base sauvegardée : $backup"
+upload_cmd=$(conf BACKUP_UPLOAD_CMD)
+if [[ -n "$upload_cmd" ]]; then
+    $upload_cmd "$backup" || die "copie de la sauvegarde hors du serveur en échec"
+fi
+# On garde les 30 dernières sauvegardes locales.
+ls -1t backups/* 2>/dev/null | tail -n +31 | xargs -r rm -f
+
+# Page de maintenance publique avant d'arrêter quoi que ce soit qui écrit.
+compose --profile maintenance up -d --force-recreate maintenance
+for attempt in {1..10}; do
+    if compose --profile maintenance exec -T maintenance sh -c 'wget -S -O /dev/null http://127.0.0.1/ 2>&1 | grep -q " 503 "'; then
+        break
+    fi
+    (( attempt < 10 )) || die "la page de maintenance ne répond pas : aucun service n'a été arrêté"
+    sleep 1
+done
+log "maintenance active"
+
+compose stop "${services[@]}"
+if [[ "$rollback" == false ]]; then
+    log "migrations"
+    compose run --rm --no-deps php php bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration \
+        || die "migration en échec : la maintenance reste active ; inspecter le schéma avant de relancer une version compatible"
+fi
+if compose run --rm --no-deps php php bin/console list --raw 2>/dev/null | grep -q '^messenger:setup-transports '; then
+    compose run --rm --no-deps php php bin/console messenger:setup-transports --no-interaction
+fi
+compose up -d --force-recreate "${services[@]}"
+
+if ! healthy; then
+    compose ps
+    compose logs --tail 50 php web || true
+    if [[ -n "$current" ]]; then
+        log "nouvelle version malsaine : retour à la version en service"
+        env_file=current.env compose up -d --force-recreate "${services[@]}"
+        if env_file=current.env healthy; then
+            env_file=current.env compose --profile maintenance stop maintenance
+            die "déploiement en échec ; version précédente remise en service"
+        fi
+    fi
+    die "contrôles en échec : la maintenance reste active ; inspecter les journaux"
+fi
+
+# Réouverture uniquement après les contrôles internes.
+compose --profile maintenance stop maintenance
+
+# Après un retour arrière, la version précédente reste celle d'avant : pas d'aller-retour vers la version écartée.
+if [[ "$rollback" == false && -n "$current" ]]; then
+    printf '%s\n' "$current" > previous.env
+fi
+cp candidate.env current.env
+if [[ "$target" == staging ]]; then
+    cp candidate.env validated.env
+else
+    grep -qxF "$php_image $web_image" history.env 2>/dev/null || printf '%s %s\n' "$php_image" "$web_image" >> history.env
+fi
+printf '%s %s %s %s\n' "$(date '+%F %T')" "$( [[ $rollback == true ]] && echo rollback || echo deploy )" "$php_image" "$web_image" >> deployments.log
+docker image prune -f --filter "until=720h" > /dev/null || true
+log "$target : version en service. Vérifier aussi HTTPS public et les parcours métier."

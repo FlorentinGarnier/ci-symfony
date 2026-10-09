@@ -1,0 +1,47 @@
+# Nginx de l'image web. TLS et HSTS sont gérés par Traefik, qui transmet X-Forwarded-For et X-Forwarded-Proto.
+# Variable substituée au démarrage : AUTH_BASIC (« off » ou un libellé d'un seul mot).
+server {
+    listen 80 default_server;
+    server_name _;
+    root /srv/app/public;
+    server_tokens off;
+    client_max_body_size 24m;
+
+    # Staging : accès restreint. Production : off.
+    auth_basic ${AUTH_BASIC};
+    auth_basic_user_file /etc/nginx/htpasswd;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml text/plain text/xml application/xml;
+
+    # Sonde de santé et robots.txt : jamais derrière l'authentification (déploiement, tests de fumée ;
+    # un robots.txt en erreur 4xx vaut « tout autorisé » pour Google).
+    location ~ ^/(healthz|robots\.txt)$ {
+        auth_basic off;
+        try_files $uri /index.php$is_args$args;
+    }
+
+    location ^~ /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri /index.php$is_args$args;
+    }
+
+    location ~ ^/index\.php(/|$) {
+        fastcgi_split_path_info ^(.+\.php)(/.*)$;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_pass php:9000;
+        internal;
+    }
+
+    location ~ \.php$ {
+        return 404;
+    }
+}
