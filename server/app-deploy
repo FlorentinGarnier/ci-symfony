@@ -20,6 +20,7 @@ app=$(basename "$0"); app=${app%-deploy}
 root=/srv/$app
 log() { printf '[%s %s] %s\n' "$app-deploy" "$(date '+%F %T')" "$*"; }
 die() { log "ERREUR : $*" >&2; exit 1; }
+trap 'log "ERREUR inattendue ligne $LINENO : $BASH_COMMAND" >&2' ERR
 
 [[ $# == 2 || $# == 3 ]] || { echo "Usage : $app-deploy staging|production PHP_IMAGE WEB_IMAGE | --rollback" >&2; exit 2; }
 target=$1
@@ -37,7 +38,8 @@ fi
 # Comptes de l'authentification de staging, montés dans l'image web : le fichier doit exister et être lisible.
 [[ -e htpasswd ]] || { touch htpasswd; chmod 644 htpasswd; }
 
-conf() { grep -E "^$1=" stack.env | tail -n1 | cut -d= -f2- | sed -e "s/^['\"]//" -e "s/['\"]$//"; }
+# Valeur d'une variable de stack.env ; vide si elle est absente (toutes sont facultatives).
+conf() { { grep -E "^$1=" stack.env || true; } | tail -n1 | cut -d= -f2- | sed -e "s/^['\"]//" -e "s/['\"]$//"; }
 prefix=$(cat "$root/image-prefix")
 [[ "$prefix" =~ ^ghcr\.io/[a-z0-9_./-]+$ ]] || die "préfixe d'images invalide dans $root/image-prefix"
 
@@ -115,7 +117,7 @@ if [[ -n "$upload_cmd" ]]; then
     $upload_cmd "$backup" || die "copie de la sauvegarde hors du serveur en échec"
 fi
 # On garde les 30 dernières sauvegardes locales.
-ls -1t backups/* 2>/dev/null | tail -n +31 | xargs -r rm -f
+ls -1t backups/* 2>/dev/null | tail -n +31 | xargs -r rm -f || true
 
 # Page de maintenance publique avant d'arrêter quoi que ce soit qui écrit.
 compose --profile maintenance up -d --force-recreate maintenance
@@ -134,7 +136,8 @@ if [[ "$rollback" == false ]]; then
     compose run --rm --no-deps php php bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration \
         || die "migration en échec : la maintenance reste active ; inspecter le schéma avant de relancer une version compatible"
 fi
-if compose run --rm --no-deps php php bin/console list --raw 2>/dev/null | grep -q '^messenger:setup-transports '; then
+# grep sans -q : il lit toute la sortie, la console ne reçoit pas de SIGPIPE (qui ferait échouer le test avec pipefail).
+if compose run --rm --no-deps php php bin/console list --raw 2>/dev/null | grep '^messenger:setup-transports ' > /dev/null; then
     compose run --rm --no-deps php php bin/console messenger:setup-transports --no-interaction
 fi
 compose up -d --force-recreate "${services[@]}"
