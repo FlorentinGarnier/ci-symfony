@@ -1,0 +1,64 @@
+# Sur la branche principale, indique si l'arbre de fichiers du commit poussé a déjà passé toute la CI d'une demande
+# de fusion. GitHub teste une PR sur son commit de fusion avec la branche principale du moment : si celle-ci n'a pas
+# bougé depuis, le commit fusionné a exactement le même arbre et rejouer les contrôles ne vérifie rien de plus.
+# Le marqueur est écrit par build.yml (entrée mark-tested-tree), qui ne tourne qu'après tous les contrôles réussis.
+# Hors branche principale, ou au moindre doute (API, marqueur absent ou venu d'un fork), la sortie vaut false.
+#
+#   jobs:
+#       tested:
+#           if: github.event_name == 'push'
+#           uses: FlorentinGarnier/ci-symfony/.github/workflows/tested-tree.yml@v1
+#           permissions:
+#               actions: read
+#               contents: read
+#       checks:
+#           needs: tested
+#           if: ${{ !cancelled() && needs.tested.outputs.tested != 'true' }}
+name: Arbre déjà testé
+
+on:
+    workflow_call:
+        inputs:
+            main-branch:
+                type: string
+                default: main
+        outputs:
+            tested:
+                description: true si une PR a déjà passé toute la CI sur exactement cet arbre
+                value: ${{ jobs.tested.outputs.tested }}
+
+permissions:
+    actions: read
+    contents: read
+
+jobs:
+    tested:
+        name: Arbre déjà testé
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            tested: ${{ steps.lookup.outputs.tested }}
+        steps:
+            -   name: Recherche du marqueur
+                id: lookup
+                env:
+                    GH_TOKEN: ${{ github.token }}
+                    MAIN: ${{ inputs.main-branch }}
+                run: |
+                    set -uo pipefail
+                    tested=false
+                    if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == "refs/heads/$MAIN" ]] \
+                        && tree=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq .tree.sha) \
+                        && [[ "$tree" =~ ^[a-f0-9]{40}$ ]]; then
+                        # Seuls les marqueurs écrits depuis ce dépôt comptent : un fork exécute son propre workflow.
+                        run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tested-tree-$tree&per_page=100" \
+                            --jq '[.artifacts[] | select(.workflow_run.head_repository_id == .workflow_run.repository_id)][0].workflow_run.id // empty') \
+                            || run_id=""
+                        if [[ "$run_id" =~ ^[0-9]+$ ]]; then
+                            tested=true
+                            echo "::notice::Arbre $tree déjà testé par l'exécution $run_id : contrôles non rejoués."
+                        else
+                            echo "Arbre $tree jamais testé tel quel : contrôles complets."
+                        fi
+                    fi
+                    echo "tested=$tested" >> "$GITHUB_OUTPUT"

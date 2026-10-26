@@ -15,6 +15,12 @@ on:
             main-branch:
                 type: string
                 default: main
+            # À n'activer que si le job appelant attend tous les contrôles de la PR (needs) : le marqueur certifie
+            # alors que l'arbre a passé toute la CI, et tested-tree.yml permet de ne pas la rejouer sur main.
+            mark-tested-tree:
+                description: Sur une PR, écrire le marqueur de l'arbre testé une fois les images construites
+                type: boolean
+                default: false
         outputs:
             php_image:
                 description: Référence par digest de l'image php (vide hors branche principale)
@@ -135,3 +141,19 @@ jobs:
                     path: release-manifest.json
                     if-no-files-found: error
                     retention-days: 90
+
+            -   name: Arbre testé
+                id: tree
+                if: inputs.mark-tested-tree && github.event_name == 'pull_request'
+                run: |
+                    tree=$(git rev-parse 'HEAD^{tree}')
+                    printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/tested-tree"
+                    echo "tree=$tree" >> "$GITHUB_OUTPUT"
+
+            -   if: steps.tree.outputs.tree != ''
+                uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+                with:
+                    name: tested-tree-${{ steps.tree.outputs.tree }}
+                    path: ${{ runner.temp }}/tested-tree
+                    if-no-files-found: error
+                    retention-days: 14

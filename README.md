@@ -9,12 +9,14 @@ les organisations : il ne contient aucun secret.
 
 ```
 PR   ──► contrôles ──► construction des images (non publiées)
-main ──► contrôles ──► images php/web publiées par digest + manifeste ──► staging ──► tests de fumée
+main ──► contrôles* ──► images php/web publiées par digest + manifeste ──► staging ──► tests de fumée
                                                                                      └─ échec ──► retour arrière
 GitHub Release publiée sur un commit recetté ──► manifeste de ce commit ──► Trivy ──► production ──► tests de fumée
                                                                                                     └─ échec ──► retour arrière
 Lancement manuel de « Production » avec une release existante ──► remise en service de cette version
 ```
+
+\* Sautés quand une PR a déjà passé toute la CI sur exactement le même arbre de fichiers (voir plus bas).
 
 Le serveur refuse en production toute paire d'images qui n'a pas été validée en staging ou déjà servie en production.
 
@@ -23,7 +25,8 @@ Le serveur refuse en production toute paire d'images qui n'a pas été validée 
 | Chemin | Rôle |
 |---|---|
 | `.github/workflows/ci.yml` | contrôles : Composer validate et audit, style, PHPStan, lint Twig/YAML/conteneur, assets ; base vide + migrations + `schema:validate`, PHPUnit, Behat |
-| `.github/workflows/build.yml` | images `php` et `web` ; sur `main`, publication sur GHCR et manifeste de version |
+| `.github/workflows/build.yml` | images `php` et `web` ; sur `main`, publication sur GHCR et manifeste de version ; sur PR, marqueur d'arbre testé (`mark-tested-tree`) |
+| `.github/workflows/tested-tree.yml` | sur `main`, indique si l'arbre poussé a déjà passé toute la CI d'une PR |
 | `.github/workflows/deploy.yml` | déploiement par SSH (commande forcée), tests de fumée, retour arrière si échec |
 | `.github/workflows/release.yml` | release → commit → exécution CI réussie → manifeste → analyse Trivy |
 | `.github/workflows/changelog.yml` | notes de release depuis la dernière release stable |
@@ -44,6 +47,18 @@ Le serveur refuse en production toute paire d'images qui n'a pas été validée 
 
 Entrées : `php-version`, `php-extensions`, `database` (`mysql` | `postgres` | `none`), `database-setup`
 (`migrations` | `schema` quand l'historique des migrations ne crée pas le schéma), `behat-tags`, `before-script`, `env`.
+
+### Contrôles non rejoués sur `main`
+
+GitHub teste une PR sur son commit de fusion avec `main` tel qu'il est au lancement. Si `main` n'a pas bougé avant
+la fusion, le commit obtenu a exactement le même arbre de fichiers : rejouer les contrôles ne vérifie rien de plus
+et coûte des minutes d'Actions. Sur PR, `build.yml` (`mark-tested-tree: true`) publie un artefact
+`tested-tree-<arbre>` une fois les images construites ; sur `main`, `tested-tree.yml` le cherche et les contrôles
+sont sautés s'il existe. Les images sont toujours construites et publiées depuis `main`, puis déployées en staging.
+Si `main` a bougé, si le marqueur vient d'un fork ou si l'API ne répond pas, tout est rejoué.
+
+Condition : le job des images doit attendre (`needs`) **tous** les contrôles du projet, y compris ceux qui lui sont
+propres, et ceux-ci doivent être sautés sur `main` seulement quand `tested == 'true'` (voir `template/`).
 
 ## Adopter la CI/CD dans un projet
 
